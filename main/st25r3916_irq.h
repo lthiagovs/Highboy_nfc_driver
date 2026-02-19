@@ -9,11 +9,12 @@
 #include <stdbool.h>
 #include "highboy_nfc_error.h"
 
-/** IRQ status snapshot (all 4 registers). */
+/** IRQ status snapshot (all 5 registers for target mode support). */
 typedef struct {
     uint8_t main;       /* REG_MAIN_INT (0x1A) */
     uint8_t timer;      /* REG_TIMER_NFC_INT (0x1B) */
     uint8_t error;      /* REG_ERROR_INT (0x1C) */
+    uint8_t target;     /* REG_TARGET_INT (0x1D) */
     uint8_t collision;  /* REG_COLLISION (0x20) */
 } st25r_irq_status_t;
 

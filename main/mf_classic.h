@@ -1,6 +1,8 @@
 /**
  * @file mf_classic.h
- * @brief MIFARE Classic — auth, read, write sectors (Phase 7).
+ * @brief MIFARE Classic — auth, read, write sectors.
+ *
+ * Fixed implementation matching Flipper Zero auth flow.
  */
 #ifndef MF_CLASSIC_H
 #define MF_CLASSIC_H
@@ -25,5 +27,12 @@ mf_classic_type_t mf_classic_get_type(uint8_t sak);
 
 /** Get number of sectors for a given type. */
 int mf_classic_get_sector_count(mf_classic_type_t type);
+
+/** Reset auth state (call before re-select). */
+void mf_classic_reset_auth(void);
+
+/** Get the last nonce (nt) received from card during auth.
+ *  Used for PRNG analysis / clone detection. */
+uint32_t mf_classic_get_last_nt(void);
 
 #endif

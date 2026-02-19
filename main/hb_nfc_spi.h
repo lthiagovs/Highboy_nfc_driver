@@ -29,4 +29,21 @@ hb_nfc_err_t hb_spi_fifo_read(uint8_t* data, size_t len);
 
 hb_nfc_err_t hb_spi_direct_cmd(uint8_t cmd);
 
+/**
+ * ST25R3916 Passive Target Memory write.
+ * Used to configure ATQA/UID/SAK for card emulation.
+ *   TX: [prefix] [data0] [data1] ... [dataN]
+ * @param prefix  0xA0=PT_MEM_A (NFC-A), 0xA8=PT_MEM_F, 0xAC=PT_MEM_TSN
+ */
+hb_nfc_err_t hb_spi_pt_mem_write(uint8_t prefix, const uint8_t* data, size_t len);
+
+/** ST25R3916 Passive Target Memory read (prefix 0xBF). */
+hb_nfc_err_t hb_spi_pt_mem_read(uint8_t* data, size_t len);
+
+/**
+ * Raw multi-byte SPI transfer.
+ * Used for custom framing (e.g. manual parity in target mode).
+ */
+hb_nfc_err_t hb_spi_raw_xfer(const uint8_t* tx, uint8_t* rx, size_t len);
+
 #endif

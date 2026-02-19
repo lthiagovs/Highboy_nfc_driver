@@ -197,3 +197,72 @@ hb_nfc_err_t hb_spi_direct_cmd(uint8_t cmd)
     esp_err_t ret = spi_device_polling_transmit(s_spi, &t);
     return (ret == ESP_OK) ? HB_NFC_OK : HB_NFC_ERR_SPI_XFER;
 }
+
+/* ═══════════════════════════════════════════════════════ */
+/*  Passive Target Memory                                  */
+/* ═══════════════════════════════════════════════════════ */
+
+/**
+ * PT Memory write — ST25R3916 SPI protocol:
+ *   TX: [prefix_byte] [data0] [data1] ... [dataN]
+ *
+ * Prefix bytes:
+ *   0xA0 = PT_MEM_A (NFC-A: ATQA/UID/SAK, 15 bytes max)
+ *   0xA8 = PT_MEM_F (NFC-F: IDm/PMm, 19 bytes max)
+ *   0xAC = PT_MEM_TSN (12 bytes max)
+ */
+hb_nfc_err_t hb_spi_pt_mem_write(uint8_t prefix, const uint8_t* data, size_t len)
+{
+    if (!data || len == 0 || len > 19) return HB_NFC_ERR_PARAM;
+
+    uint8_t tx[1 + 19];
+    tx[0] = prefix;
+    memcpy(&tx[1], data, len);
+
+    spi_transaction_t t = {
+        .length    = (uint32_t)((len + 1) * 8),
+        .tx_buffer = tx,
+    };
+    esp_err_t ret = spi_device_polling_transmit(s_spi, &t);
+    return (ret == ESP_OK) ? HB_NFC_OK : HB_NFC_ERR_SPI_XFER;
+}
+
+/**
+ * PT Memory read — ST25R3916 SPI protocol:
+ *   TX: [0xBF] [0x00] ... [0x00]
+ *   RX: [xx]   [d0]   ... [dN]
+ */
+hb_nfc_err_t hb_spi_pt_mem_read(uint8_t* data, size_t len)
+{
+    if (!data || len == 0 || len > 19) return HB_NFC_ERR_PARAM;
+
+    uint8_t tx[1 + 19] = { 0 };
+    uint8_t rx[1 + 19] = { 0 };
+    tx[0] = 0xBF;
+
+    spi_transaction_t t = {
+        .length    = (uint32_t)((len + 1) * 8),
+        .tx_buffer = tx,
+        .rx_buffer = rx,
+    };
+    esp_err_t ret = spi_device_polling_transmit(s_spi, &t);
+    if (ret != ESP_OK) return HB_NFC_ERR_SPI_XFER;
+    memcpy(data, &rx[1], len);
+    return HB_NFC_OK;
+}
+
+/**
+ * Raw SPI transfer — for arbitrary length transactions.
+ */
+hb_nfc_err_t hb_spi_raw_xfer(const uint8_t* tx, uint8_t* rx, size_t len)
+{
+    if (len == 0 || len > 64) return HB_NFC_ERR_PARAM;
+
+    spi_transaction_t t = {
+        .length    = (uint32_t)(len * 8),
+        .tx_buffer = tx,
+        .rx_buffer = rx,
+    };
+    esp_err_t ret = spi_device_polling_transmit(s_spi, &t);
+    return (ret == ESP_OK) ? HB_NFC_OK : HB_NFC_ERR_SPI_XFER;
+}

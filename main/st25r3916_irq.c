@@ -22,6 +22,7 @@ st25r_irq_status_t st25r_irq_read(void)
     hb_spi_reg_read(REG_ERROR_INT,     &s.error);
     hb_spi_reg_read(REG_TIMER_NFC_INT, &s.timer);
     hb_spi_reg_read(REG_MAIN_INT,      &s.main);
+    hb_spi_reg_read(REG_TARGET_INT,    &s.target);
     hb_spi_reg_read(REG_COLLISION,      &s.collision);
     return s;
 }
@@ -29,8 +30,8 @@ st25r_irq_status_t st25r_irq_read(void)
 void st25r_irq_log(const char* ctx, uint16_t fifo_count)
 {
     st25r_irq_status_t s = st25r_irq_read();
-    ESP_LOGW(TAG, " %s IRQ: MAIN=0x%02X ERR=0x%02X TMR=0x%02X COL=0x%02X FIFO=%u",
-             ctx, s.main, s.error, s.timer, s.collision, fifo_count);
+    ESP_LOGW(TAG, " %s IRQ: MAIN=0x%02X ERR=0x%02X TMR=0x%02X TGT=0x%02X COL=0x%02X FIFO=%u",
+             ctx, s.main, s.error, s.timer, s.target, s.collision, fifo_count);
 }
 
 /**

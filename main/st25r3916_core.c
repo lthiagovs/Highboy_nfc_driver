@@ -169,6 +169,33 @@ bool st25r_field_is_on(void)
     return s_drv.field;
 }
 
+/**
+ * Field cycle — briefly toggle field OFF then ON.
+ *
+ * After Crypto1 authentication, the card is in AUTHENTICATED state and
+ * will NOT respond to WUPA. The only reliable way to reset it is to
+ * power-cycle by removing the RF field briefly.
+ *
+ * Timing: 5ms off + 5ms on (minimum 1ms off required by ISO14443).
+ */
+hb_nfc_err_t st25r_field_cycle(void)
+{
+    if (!s_drv.init) return HB_NFC_ERR_INTERNAL;
+
+    /* Field OFF */
+    hb_spi_reg_write(REG_OP_CTRL, 0x00);
+    s_drv.field = false;
+    hb_delay_us(5000);   /* 5ms — card loses power */
+
+    /* Field ON */
+    hb_spi_reg_write(REG_OP_CTRL, OP_CTRL_FIELD_ON);
+    hb_delay_us(5000);   /* 5ms — card boot time */
+    hb_spi_direct_cmd(CMD_RESET_RX_GAIN);
+    s_drv.field = true;
+
+    return HB_NFC_OK;
+}
+
 /* ═══════════════════════════════════════════════════════ */
 /*  Mode Configuration                                     */
 /* ═══════════════════════════════════════════════════════ */

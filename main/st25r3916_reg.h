@@ -79,9 +79,19 @@
 #define MODE_POLL_NFCB          0x10
 #define MODE_POLL_NFCF          0x20
 #define MODE_POLL_NFCV          0x30
+#define MODE_TARGET             0x80      /* Bit 7: target mode */
+#define MODE_TARGET_NFCA        0x88      /* Target + NFC-A */
+
+/* REG_PASSIVE_TARGET (0x08) */
+#define PT_D_106_AC_A           0x01      /* Disable NFC-A auto collision */
+#define PT_D_212_424_1_AC_F     0x02      /* Disable NFC-F auto collision */
+#define PT_D_AP2P_AC            0x04      /* Disable P2P auto collision */
+#define PT_RFU                  0x00      /* All auto-responses enabled */
 
 /* REG_ISO14443A (0x05) — anti-collision bit */
 #define ISO14443A_ANTCL         0x01
+#define ISO14443A_NO_TX_PAR     0x80      /* Disable auto TX parity */
+#define ISO14443A_NO_RX_PAR     0x40      /* Disable RX parity check */
 
 /* REG_MAIN_INT (0x1A) bits */
 #define IRQ_MAIN_OSC            (1 << 7)
@@ -95,5 +105,32 @@
 #define IC_TYPE_MASK            0xF8
 #define IC_TYPE_SHIFT           3
 #define IC_REV_MASK             0x07
+
+/* REG_TARGET_INT (0x1D) bits */
+#define IRQ_TGT_WU_A            (1 << 7)  /* NFC-A wakeup (REQA/WUPA received) */
+#define IRQ_TGT_WU_A_X          (1 << 6)  /* NFC-A auto-collision complete */
+#define IRQ_TGT_WU_F            (1 << 5)  /* NFC-F wakeup */
+#define IRQ_TGT_RFU4            (1 << 4)
+#define IRQ_TGT_OSCF            (1 << 3)  /* Oscillator frequency stable */
+#define IRQ_TGT_SDD_C           (1 << 2)  /* SDD complete (selected) */
+#define IRQ_TGT_RFU1            (1 << 1)
+#define IRQ_TGT_RFU0            (1 << 0)
+
+/* REG_MASK_TARGET_INT (0x19) — interrupt mask for target */
+#define IRQ_TGT_MASK_NONE       0xFF      /* All masked (disabled) */
+#define IRQ_TGT_MASK_ALL        0x00      /* All unmasked (enabled) */
+
+/* REG_FIELD_THRESH_ACT (0x2A) */
+#define FIELD_THRESH_ACT_TRG    0x09      /* Activation field threshold */
+
+/* REG_FIELD_THRESH_DEACT (0x2B) */
+#define FIELD_THRESH_DEACT_TRG  0x05      /* Deactivation field threshold */
+
+/* ── SPI Passive Target Memory Prefixes ── */
+#define SPI_PT_MEM_A_WRITE      0xA0      /* Write NFC-A PT memory (15 bytes) */
+#define SPI_PT_MEM_F_WRITE      0xA8      /* Write NFC-F PT memory (19 bytes) */
+#define SPI_PT_MEM_TSN_WRITE    0xAC      /* Write TSN PT memory (12 bytes) */
+#define SPI_PT_MEM_READ         0xBF      /* Read PT memory */
+#define SPI_PT_MEM_A_LEN        15        /* NFC-A PT memory length */
 
 #endif

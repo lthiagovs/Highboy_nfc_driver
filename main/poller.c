@@ -10,6 +10,7 @@
 #include "nfc_poller.h"
 #include "nfc_common.h"
 #include "st25r3916_cmd.h"
+#include "st25r3916_core.h"
 #include "st25r3916_reg.h"
 #include "st25r3916_fifo.h"
 #include "st25r3916_irq.h"
@@ -217,25 +218,42 @@ hb_nfc_err_t iso14443a_poller_select(nfc_iso14443a_data_t* card)
 }
 
 /**
- * Re-select — from working code reselect() macro:
- *   WUPA → anticoll CL1 → select CL1
+ * Re-select a card after Crypto1 session.
  *
- * Note: This is a simplified re-select that only does CL1.
- * For 7/10-byte UIDs the full cascade would need to be repeated.
+ * After Crypto1 authentication the card is in AUTHENTICATED state
+ * and will NOT respond to WUPA/REQA. We must power-cycle the RF field
+ * to force the card back to IDLE state, then do full activation.
+ *
+ * Flow: field OFF → field ON → REQA/WUPA → anticoll → select (all CLs)
  */
 hb_nfc_err_t iso14443a_poller_reselect(nfc_iso14443a_data_t* card)
 {
+    /* Power-cycle the RF field to reset card state */
+    st25r_field_cycle();
+
+    /* Now do full activation (REQA/WUPA → anticoll → select) */
     uint8_t atqa[2];
-    if (req_cmd(CMD_TX_WUPA, atqa) != 2) return HB_NFC_ERR_NO_CARD;
+    hb_nfc_err_t err = iso14443a_poller_activate(atqa);
+    if (err != HB_NFC_OK) return err;
 
-    uint8_t uid_cl[5];
-    if (iso14443a_poller_anticoll(SEL_CL1, uid_cl) != 5) return HB_NFC_ERR_COLLISION;
-    if (!iso14443a_poller_sel(SEL_CL1, uid_cl, &card->sak)) return HB_NFC_ERR_PROTOCOL;
+    /* Anti-collision + SELECT for all cascade levels */
+    static const uint8_t sel_cmds[] = { SEL_CL1, SEL_CL2, SEL_CL3 };
 
-    /* For 7-byte UID, do CL2 too */
-    if (card->sak & 0x04) {
-        if (iso14443a_poller_anticoll(SEL_CL2, uid_cl) != 5) return HB_NFC_ERR_COLLISION;
-        if (!iso14443a_poller_sel(SEL_CL2, uid_cl, &card->sak)) return HB_NFC_ERR_PROTOCOL;
+    for (int cl = 0; cl < 3; cl++) {
+        uint8_t uid_cl[5] = { 0 };
+        uint8_t sak = 0;
+
+        if (iso14443a_poller_anticoll(sel_cmds[cl], uid_cl) != 5) {
+            return HB_NFC_ERR_COLLISION;
+        }
+        if (!iso14443a_poller_sel(sel_cmds[cl], uid_cl, &sak)) {
+            return HB_NFC_ERR_PROTOCOL;
+        }
+
+        card->sak = sak;
+
+        /* Check if more cascade levels needed */
+        if (!(sak & 0x04)) break;
     }
 
     return HB_NFC_OK;

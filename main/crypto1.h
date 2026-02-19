@@ -2,22 +2,76 @@
  * @file crypto1.h
  * @brief Crypto1 cipher for MIFARE Classic.
  *
- * TODO: LFSR implementation, encrypt/decrypt, parity generation.
+ * Implementation matches Flipper Zero / proxmark3 exactly:
+ *   - Split odd/even LFSR representation
+ *   - BEBIT macro for byte-swapped bit processing
+ *   - SWAPENDIAN in prng_successor
+ *   - Parity generation without LFSR advancement
  */
-#ifndef CRYPTO1_H
-#define CRYPTO1_H
-
+#pragma once
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Split odd/even LFSR state — matches Flipper Zero / proxmark3.
+ *
+ * The 48-bit LFSR is stored with even-indexed bits in .even
+ * and odd-indexed bits in .odd.  This representation is required
+ * for correct filter function evaluation.
+ */
 typedef struct {
-    uint64_t state;
+    uint32_t odd;
+    uint32_t even;
 } crypto1_state_t;
 
-void crypto1_init(crypto1_state_t* s, uint64_t key);
-uint8_t crypto1_bit(crypto1_state_t* s, uint8_t in, int is_encrypted);
-uint8_t crypto1_byte(crypto1_state_t* s, uint8_t in, int is_encrypted);
-void crypto1_encrypt(crypto1_state_t* s, uint8_t* data, size_t len);
-void crypto1_decrypt(crypto1_state_t* s, uint8_t* data, size_t len);
+/** Initialise the LFSR with a 48-bit key. */
+void    crypto1_init(crypto1_state_t *s, uint64_t key);
 
+/** Reset LFSR state to zero. */
+void    crypto1_reset(crypto1_state_t *s);
+
+/**
+ * Clock one bit through the cipher.
+ *
+ * @param s            Cipher state.
+ * @param in           Input bit.
+ * @param is_encrypted 0 = TX / priming, 1 = RX (encrypted input).
+ * @return Keystream bit.
+ */
+uint8_t crypto1_bit(crypto1_state_t *s, uint8_t in, int is_encrypted);
+
+/** Clock one byte (8 bits, LSB first). Returns keystream byte. */
+uint8_t crypto1_byte(crypto1_state_t *s, uint8_t in, int is_encrypted);
+
+/**
+ * Clock one 32-bit word through the cipher.
+ * Uses BEBIT byte-swapped bit ordering (proxmark3/Flipper compatible).
+ * Returns keystream word in BEBIT order.
+ */
+uint32_t crypto1_word(crypto1_state_t *s, uint32_t in, int is_encrypted);
+
+/**
+ * Get the current filter output WITHOUT advancing the LFSR.
+ * Used for parity bit encryption (the 9th keystream bit per byte).
+ */
+uint8_t crypto1_filter_output(crypto1_state_t *s);
+
+/**
+ * MIFARE Classic card PRNG with proper SWAPENDIAN.
+ * Input and output are in big-endian byte order (as received on wire).
+ */
+uint32_t crypto1_prng_successor(uint32_t x, uint32_t n);
+
+/** Odd parity of a byte (1 if odd number of set bits). */
+uint8_t crypto1_odd_parity8(uint8_t data);
+
+/** Even parity of a 32-bit word. */
+uint8_t crypto1_even_parity32(uint32_t data);
+
+#ifdef __cplusplus
+}
 #endif
