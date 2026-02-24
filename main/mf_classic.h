@@ -22,6 +22,16 @@ hb_nfc_err_t mf_classic_read_block(uint8_t block, uint8_t data[16]);
 /** Write a single block (16 bytes). Must be authenticated first. */
 hb_nfc_err_t mf_classic_write_block(uint8_t block, const uint8_t data[16]);
 
+/** Write phase (for debugging NACKs). */
+typedef enum {
+    MF_WRITE_PHASE_NONE = 0,
+    MF_WRITE_PHASE_CMD,
+    MF_WRITE_PHASE_DATA,
+} mf_write_phase_t;
+
+/** Get last write phase reached (CMD or DATA). */
+mf_write_phase_t mf_classic_get_last_write_phase(void);
+
 /** Get card type from SAK. */
 mf_classic_type_t mf_classic_get_type(uint8_t sak);
 

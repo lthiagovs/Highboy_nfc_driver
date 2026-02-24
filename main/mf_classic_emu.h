@@ -1,0 +1,281 @@
+/**
+ * @file mf_classic_emu.h
+ * @brief MIFARE Classic Card Emulation — Flipper Zero-level quality.
+ *
+ * Complete card emulation on ST25R3916 passive target mode:
+ *
+ *   ┌──────────────────────────────────────────────────────────┐
+ *   │  Hardware handles: REQA/WUPA → Anti-collision → SELECT   │
+ *   │  MCU handles:      AUTH → READ → WRITE → VALUE OPS       │
+ *   │                     All with Crypto1 encrypted parity     │
+ *   └──────────────────────────────────────────────────────────┘
+ *
+ * Features matching Flipper Zero mf_classic_listener:
+ *   ✓ Full Crypto1 auth (Key A + Key B)
+ *   ✓ Encrypted parity bits (9th bit per byte)
+ *   ✓ READ command with sector trailer masking
+ *   ✓ WRITE command (2-phase) with access control
+ *   ✓ Value block ops: INCREMENT, DECREMENT, RESTORE, TRANSFER
+ *   ✓ Re-authentication across sectors
+ *   ✓ Proper 4-bit NACK responses
+ *   ✓ Access bits verification before operations
+ *   ✓ Field loss detection + automatic recovery
+ *   ✓ 7-byte UID support (dual cascade)
+ *   ✓ Card type: Mini / 1K / 4K
+ *   ✓ NVS profile save/load for persistent emulation
+ *   ✓ Callback system for UI notifications
+ */
+#ifndef MF_CLASSIC_EMU_H
+#define MF_CLASSIC_EMU_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "highboy_nfc_types.h"
+#include "highboy_nfc_error.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ═══════════════════════════════════════════════════════════
+ *  Constants
+ * ═══════════════════════════════════════════════════════════ */
+
+#define MFC_EMU_MAX_SECTORS     40    /* Classic 4K = 40 sectors */
+#define MFC_EMU_MAX_BLOCKS      256   /* Classic 4K = 256 blocks */
+#define MFC_EMU_BLOCK_SIZE      16
+
+/* MIFARE Classic ACK/NACK (4-bit) */
+#define MFC_ACK                 0x0A  /* 4-bit ACK */
+#define MFC_NACK_INVALID_OP     0x00  /* 4-bit NACK: invalid op */
+#define MFC_NACK_PARITY_CRC     0x01  /* 4-bit NACK: parity/CRC */
+#define MFC_NACK_OTHER          0x04  /* 4-bit NACK: other */
+#define MFC_NACK_NAK            0x05  /* 4-bit NACK: not acknowledged */
+
+/* MIFARE Classic Commands */
+#define MFC_CMD_AUTH_KEY_A      0x60
+#define MFC_CMD_AUTH_KEY_B      0x61
+#define MFC_CMD_READ            0x30
+#define MFC_CMD_WRITE           0xA0
+#define MFC_CMD_DECREMENT       0xC0
+#define MFC_CMD_INCREMENT       0xC1
+#define MFC_CMD_RESTORE         0xC2
+#define MFC_CMD_TRANSFER        0xB0
+#define MFC_CMD_HALT            0x50
+
+/* Access condition bits */
+typedef enum {
+    MFC_AC_DATA_RD_AB  = 0,   /* C1C2C3 = 000: read A|B, write A|B */
+    MFC_AC_DATA_RD_AB_W_NONE = 2, /* C1C2C3 = 010: read A|B, write never */
+    MFC_AC_DATA_RD_AB_W_B    = 4, /* C1C2C3 = 100: read A|B, write B */
+    MFC_AC_DATA_NEVER        = 7, /* C1C2C3 = 111: never read/write */
+} mfc_ac_data_t;
+
+/* ═══════════════════════════════════════════════════════════
+ *  Card Data Storage
+ * ═══════════════════════════════════════════════════════════ */
+
+typedef struct {
+    /* Card identity */
+    uint8_t             uid[10];
+    uint8_t             uid_len;       /* 4, 7, or 10 */
+    uint8_t             atqa[2];
+    uint8_t             sak;
+    mf_classic_type_t   type;
+
+    /* Block data (full dump) */
+    uint8_t             blocks[MFC_EMU_MAX_BLOCKS][MFC_EMU_BLOCK_SIZE];
+    int                 total_blocks;
+
+    /* Key storage (for auth handling) */
+    struct {
+        uint8_t key_a[6];
+        uint8_t key_b[6];
+        bool    key_a_known;
+        bool    key_b_known;
+    } keys[MFC_EMU_MAX_SECTORS];
+
+    int                 sector_count;
+} mfc_emu_card_data_t;
+
+/* ═══════════════════════════════════════════════════════════
+ *  Emulator State Machine
+ * ═══════════════════════════════════════════════════════════ */
+
+typedef enum {
+    MFC_EMU_STATE_IDLE = 0,           /* Not started */
+    MFC_EMU_STATE_LISTEN,             /* Waiting for reader field */
+    MFC_EMU_STATE_ACTIVATED,          /* Selected by reader, waiting for command */
+    MFC_EMU_STATE_AUTH_SENT_NT,       /* Sent nt, waiting for {nr}{ar} */
+    MFC_EMU_STATE_AUTHENTICATED,      /* Crypto1 active, processing commands */
+    MFC_EMU_STATE_WRITE_PENDING,      /* WRITE phase 1 done, waiting for data */
+    MFC_EMU_STATE_VALUE_PENDING,      /* Value op phase 1 done, waiting for value */
+    MFC_EMU_STATE_HALTED,             /* HALT received */
+    MFC_EMU_STATE_ERROR,              /* Error occurred */
+} mfc_emu_state_t;
+
+/* ═══════════════════════════════════════════════════════════
+ *  Statistics
+ * ═══════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int total_auths;
+    int successful_auths;
+    int failed_auths;
+    int reads_served;
+    int writes_served;
+    int writes_blocked;      /* Writes rejected by access control */
+    int value_ops;           /* INC/DEC/RESTORE/TRANSFER */
+    int halts;
+    int nacks_sent;
+    int unknown_cmds;
+    int field_losses;
+    int cycles;              /* How many times activated */
+    int parity_errors;       /* Encrypted parity mismatches detected */
+} mfc_emu_stats_t;
+
+/* ═══════════════════════════════════════════════════════════
+ *  Event Callbacks (for UI integration)
+ * ═══════════════════════════════════════════════════════════ */
+
+typedef enum {
+    MFC_EMU_EVT_ACTIVATED,          /* Reader selected us */
+    MFC_EMU_EVT_AUTH_SUCCESS,       /* Authentication OK */
+    MFC_EMU_EVT_AUTH_FAIL,          /* Authentication failed */
+    MFC_EMU_EVT_READ,               /* Block read served */
+    MFC_EMU_EVT_WRITE,              /* Block write completed */
+    MFC_EMU_EVT_WRITE_BLOCKED,      /* Write blocked by AC */
+    MFC_EMU_EVT_VALUE_OP,           /* Value operation done */
+    MFC_EMU_EVT_HALT,               /* HALT received */
+    MFC_EMU_EVT_FIELD_LOST,         /* RF field disappeared */
+    MFC_EMU_EVT_ERROR,              /* Error occurred */
+} mfc_emu_event_type_t;
+
+typedef struct {
+    mfc_emu_event_type_t type;
+    union {
+        struct { int sector; mf_key_type_t key_type; } auth;
+        struct { uint8_t block; } read;
+        struct { uint8_t block; } write;
+        struct { uint8_t cmd; uint8_t block; int32_t value; } value_op;
+    };
+} mfc_emu_event_t;
+
+typedef void (*mfc_emu_event_cb_t)(const mfc_emu_event_t* evt, void* ctx);
+
+/* ═══════════════════════════════════════════════════════════
+ *  Public API
+ * ═══════════════════════════════════════════════════════════ */
+
+/**
+ * Initialize emulator with card data.
+ * Copies the card dump into internal storage.
+ */
+hb_nfc_err_t mfc_emu_init(const mfc_emu_card_data_t* card);
+
+/**
+ * Set event callback for UI notifications.
+ */
+void mfc_emu_set_callback(mfc_emu_event_cb_t cb, void* ctx);
+
+/**
+ * Configure ST25R3916 hardware for target mode.
+ * Loads PT memory, sets mode, unmasks interrupts.
+ */
+hb_nfc_err_t mfc_emu_configure_target(void);
+
+/**
+ * Load PT Memory — public wrapper for diagnostics.
+ * Writes ATQA/UID/BCC/SAK to chip's passive target memory.
+ */
+hb_nfc_err_t mfc_emu_load_pt_memory(void);
+
+/**
+ * Start emulation — enters listen state.
+ * CMD_GOTO_SENSE to start listening for reader.
+ */
+hb_nfc_err_t mfc_emu_start(void);
+
+/**
+ * Run one cycle of the emulation loop.
+ * Call this repeatedly from main loop.
+ * Returns current state.
+ */
+mfc_emu_state_t mfc_emu_run_step(void);
+
+/**
+ * Stop emulation — return to idle.
+ */
+void mfc_emu_stop(void);
+
+/**
+ * Update card data while emulator is running (hot swap).
+ * Used for switching profiles without restarting.
+ */
+hb_nfc_err_t mfc_emu_update_card(const mfc_emu_card_data_t* card);
+
+/**
+ * Get emulation statistics.
+ */
+mfc_emu_stats_t mfc_emu_get_stats(void);
+
+/**
+ * Get current state.
+ */
+mfc_emu_state_t mfc_emu_get_state(void);
+
+/**
+ * Get state name string.
+ */
+const char* mfc_emu_state_str(mfc_emu_state_t state);
+
+/**
+ * Helper: fill card data from a successful read.
+ */
+void mfc_emu_card_data_init(mfc_emu_card_data_t* cd,
+                             const nfc_iso14443a_data_t* card,
+                             mf_classic_type_t type);
+
+/* ═══════════════════════════════════════════════════════════
+ *  Access Control Helpers (public for testing)
+ * ═══════════════════════════════════════════════════════════ */
+
+/**
+ * Extract access condition bits (C1, C2, C3) for a block within a sector.
+ * @param trailer  16-byte sector trailer data
+ * @param block_in_sector  Block index within sector (0-3 for 4-block, 0-15 for 16-block)
+ * @param c1, c2, c3  Output access condition bits
+ * @return true if access bits parity is valid
+ */
+bool mfc_emu_get_access_bits(const uint8_t trailer[16], int block_in_sector,
+                              uint8_t* c1, uint8_t* c2, uint8_t* c3);
+
+/**
+ * Check if a READ is permitted.
+ */
+bool mfc_emu_can_read(const uint8_t trailer[16], int block_in_sector,
+                       mf_key_type_t auth_key_type);
+
+/**
+ * Check if a WRITE is permitted.
+ */
+bool mfc_emu_can_write(const uint8_t trailer[16], int block_in_sector,
+                        mf_key_type_t auth_key_type);
+
+/**
+ * Check if INCREMENT is permitted (data blocks only).
+ */
+bool mfc_emu_can_increment(const uint8_t trailer[16], int block_in_sector,
+                            mf_key_type_t auth_key_type);
+
+/**
+ * Check if DECREMENT/RESTORE/TRANSFER is permitted (data blocks only).
+ */
+bool mfc_emu_can_decrement(const uint8_t trailer[16], int block_in_sector,
+                            mf_key_type_t auth_key_type);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* MF_CLASSIC_EMU_H */

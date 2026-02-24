@@ -69,6 +69,7 @@ static const char* TAG = "mf_cl";
 static crypto1_state_t s_crypto;
 static bool            s_auth = false;
 static uint32_t        s_last_nt = 0;  /* Last nonce for PRNG analysis */
+static mf_write_phase_t s_last_write_phase = MF_WRITE_PHASE_NONE;
 
 /* ── Helpers ── */
 
@@ -250,6 +251,71 @@ static hb_nfc_err_t mf_classic_transceive_encrypted(
         rx[i] = plain;
     }
 
+    return HB_NFC_OK;
+}
+
+static hb_nfc_err_t mf_classic_tx_encrypted_with_ack(
+    crypto1_state_t* st,
+    const uint8_t* tx, size_t tx_len,
+    uint8_t* ack_nibble,
+    int timeout_ms)
+{
+    if (!st || !tx || tx_len == 0) return HB_NFC_ERR_PARAM;
+
+    const size_t tx_bits  = tx_len * 9;      /* 8 data + 1 parity per byte */
+    const size_t tx_bytes = (tx_bits + 7U) / 8U;
+    if (tx_bytes > 32) return HB_NFC_ERR_PARAM;
+
+    uint8_t tx_buf[32] = { 0 };
+
+    size_t bitpos = 0;
+    for (size_t i = 0; i < tx_len; i++) {
+        uint8_t plain  = tx[i];
+        uint8_t ks     = crypto1_byte(st, 0, 0);
+        uint8_t enc    = plain ^ ks;
+
+        for (int bit = 0; bit < 8; bit++) {
+            bit_set(tx_buf, bitpos++, (enc >> bit) & 1U);
+        }
+
+        uint8_t par_ks = crypto1_filter_output(st);
+        uint8_t par    = crypto1_odd_parity8(plain) ^ par_ks;
+        bit_set(tx_buf, bitpos++, par);
+    }
+
+    uint8_t iso = 0;
+    hb_spi_reg_read(REG_ISO14443A, &iso);
+    hb_spi_reg_write(REG_ISO14443A, (uint8_t)(iso | ISOA_NO_TX_PAR | ISOA_NO_RX_PAR));
+
+    st25r_fifo_clear();
+    st25r_set_tx_bytes((uint16_t)(tx_bits / 8U), (uint8_t)(tx_bits % 8U));
+    st25r_fifo_load(tx_buf, tx_bytes);
+    hb_spi_direct_cmd(CMD_TX_WO_CRC);
+
+    if (!st25r_irq_wait_txe()) {
+        hb_spi_reg_write(REG_ISO14443A, iso);
+        return HB_NFC_ERR_TX_TIMEOUT;
+    }
+
+    uint16_t count = 0;
+    (void)st25r_fifo_wait(1, timeout_ms, &count);
+    if (count < 1) {
+        hb_spi_reg_write(REG_ISO14443A, iso);
+        return HB_NFC_ERR_TIMEOUT;
+    }
+
+    uint8_t enc_ack = 0;
+    st25r_fifo_read(&enc_ack, 1);
+    hb_spi_reg_write(REG_ISO14443A, iso);
+
+    uint8_t plain_ack = 0;
+    for (int i = 0; i < 4; i++) {
+        uint8_t ks_bit   = crypto1_bit(st, 0, 0);
+        uint8_t enc_bit  = (enc_ack >> i) & 1U;
+        plain_ack |= (uint8_t)((enc_bit ^ ks_bit) << i);
+    }
+
+    if (ack_nibble) *ack_nibble = (uint8_t)(plain_ack & 0x0F);
     return HB_NFC_OK;
 }
 
@@ -467,8 +533,46 @@ hb_nfc_err_t mf_classic_read_block(uint8_t block, uint8_t data[16])
 
 hb_nfc_err_t mf_classic_write_block(uint8_t block, const uint8_t data[16])
 {
-    (void)block; (void)data;
-    return HB_NFC_ERR_INTERNAL;  /* TODO: implement following Flipper pattern */
+    if (!data) return HB_NFC_ERR_PARAM;
+    if (!s_auth) return HB_NFC_ERR_AUTH;
+
+    /* Phase 1: WRITE command */
+    uint8_t cmd[4] = { 0xA0, block, 0, 0 };
+    iso14443a_crc(cmd, 2, &cmd[2]);
+
+    uint8_t ack = 0;
+    s_last_write_phase = MF_WRITE_PHASE_CMD;
+    hb_nfc_err_t err = mf_classic_tx_encrypted_with_ack(&s_crypto, cmd, sizeof(cmd),
+                                                        &ack, 20);
+    if (err != HB_NFC_OK) {
+        s_auth = false;
+        return err;
+    }
+    if ((ack & 0x0F) != 0x0A) {
+        ESP_LOGW(TAG, "Write cmd NACK (bloco %d): 0x%02X", block, ack);
+        s_auth = false;
+        return HB_NFC_ERR_NACK;
+    }
+
+    /* Phase 2: 16 bytes data + CRC */
+    uint8_t frame[18];
+    memcpy(frame, data, 16);
+    iso14443a_crc(frame, 16, &frame[16]);
+
+    s_last_write_phase = MF_WRITE_PHASE_DATA;
+    err = mf_classic_tx_encrypted_with_ack(&s_crypto, frame, sizeof(frame),
+                                           &ack, 20);
+    if (err != HB_NFC_OK) {
+        s_auth = false;
+        return err;
+    }
+    if ((ack & 0x0F) != 0x0A) {
+        ESP_LOGW(TAG, "Write data NACK (bloco %d): 0x%02X", block, ack);
+        s_auth = false;
+        return HB_NFC_ERR_NACK;
+    }
+
+    return HB_NFC_OK;
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -498,4 +602,9 @@ int mf_classic_get_sector_count(mf_classic_type_t type)
 uint32_t mf_classic_get_last_nt(void)
 {
     return s_last_nt;
+}
+
+mf_write_phase_t mf_classic_get_last_write_phase(void)
+{
+    return s_last_write_phase;
 }

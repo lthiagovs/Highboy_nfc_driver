@@ -24,7 +24,18 @@ uint16_t st25r_fifo_count(void)
 
 void st25r_fifo_clear(void)
 {
-    hb_spi_direct_cmd(CMD_CLEAR_FIFO);
+    /* NOTE: The ST25R3916 has NO dedicated "clear FIFO" command.
+     * The old code used 0xDB (transparent mode) here as a NOP.
+     * CMD_CLEAR (0xC2) would stop all activities and break
+     * the target state machine during emulation.
+     *
+     * The FIFO is automatically flushed when new data is loaded
+     * via SPI_FIFO_LOAD (0x80), so this function is a NOP.
+     *
+     * If you truly need to clear the FIFO, write 0x02 to
+     * REG_FIFO_STATUS2 (bit 1 = flush flag on some revisions).
+     */
+    (void)0;  /* NOP — FIFO clears on next load */
 }
 
 hb_nfc_err_t st25r_fifo_load(const uint8_t* data, size_t len)
