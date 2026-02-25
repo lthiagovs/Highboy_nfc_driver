@@ -37,12 +37,26 @@ typedef enum {
 const char* mf_write_result_str(mf_write_result_t r);
 
 /**
+ * @brief Access bits (C1/C2/C3) for groups 0..3.
+ *
+ * Grupo 0..3 mapeia:
+ *   - Mini/1K: blocos 0,1,2,3 (trailer = grupo 3)
+ *   - 4K (setores 32-39): grupos 0-2 cobrem 5 blocos cada,
+ *     grupo 3 é o trailer (bloco 15).
+ */
+typedef struct {
+    uint8_t c1[4];
+    uint8_t c2[4];
+    uint8_t c3[4];
+} mf_classic_access_bits_t;
+
+/**
  * @brief Escreve 16 bytes num bloco já autenticado (sessão ativa).
  *
  * Chame esta função IMEDIATAMENTE após mf_classic_auth() —
  * a sessão Crypto1 deve estar ativa.
  *
- * @param block  Número absoluto do bloco (0–63 para 1K).
+ * @param block  Número absoluto do bloco (Mini: 0-19, 1K: 0-63, 4K: 0-255).
  * @param data   16 bytes a escrever.
  * @return MF_WRITE_OK ou código de erro.
  */
@@ -80,9 +94,10 @@ mf_write_result_t mf_classic_write(nfc_iso14443a_data_t* card,
  * Faz apenas UM reselect + auth por setor (eficiente).
  *
  * @param card      Dados do cartão.
- * @param sector    Número do setor (0–15 para 1K).
+ * @param sector    Número do setor (Mini: 0-4, 1K: 0-15, 4K: 0-39).
  * @param data      Buffer com (blocks_in_sector - 1) * 16 bytes.
- *                  Para 1K: 3 blocos × 16 = 48 bytes por setor.
+ *                  Para Mini/1K: 3 blocos x 16 = 48 bytes por setor.
+ *                  Para 4K (setores 32-39): 15 blocos x 16 = 240 bytes.
  * @param key       Chave de 6 bytes.
  * @param key_type  MF_KEY_A ou MF_KEY_B.
  * @param verify    Verifica cada bloco após escrita.
@@ -96,11 +111,45 @@ int mf_classic_write_sector(nfc_iso14443a_data_t* card,
                              bool                  verify);
 
 /**
- * @brief Gera um trailer válido a partir de chaves e access bits.
+ * @brief Codifica access bits (C1/C2/C3) nos 3 bytes do trailer.
  *
- * Calcula os bytes de paridade automaticamente.
- * Access bits padrão seguros: FF 07 80 (todos os blocos leitura/escrita
- * por Key A e B, trailer protegido por Key B).
+ * Gera bytes 6-8 já com as inversões/paridade corretas.
+ * Retorna false se algum bit não for 0/1.
+ */
+bool mf_classic_access_bits_encode(const mf_classic_access_bits_t* ac,
+                                    uint8_t                         out_access_bits[3]);
+
+/**
+ * @brief Valida paridade/inversões dos 3 bytes de access bits.
+ *
+ * @param access_bits 3 bytes (bytes 6-8 do trailer).
+ * @return true se os bits são consistentes.
+ */
+bool mf_classic_access_bits_valid(const uint8_t access_bits[3]);
+
+/**
+ * @brief Gera um trailer “seguro” a partir de chaves e access bits (C1/C2/C3).
+ *
+ * Calcula os bytes 6-8 automaticamente e valida as inversões.
+ *
+ * @param key_a       6 bytes da Key A.
+ * @param key_b       6 bytes da Key B.
+ * @param ac          Access bits C1/C2/C3 por grupo (0..3).
+ * @param gpb         General Purpose Byte (byte 9).
+ * @param out_trailer Buffer de 16 bytes de saída.
+ * @return true se o trailer foi montado com sucesso.
+ */
+bool mf_classic_build_trailer_safe(const uint8_t              key_a[6],
+                                    const uint8_t              key_b[6],
+                                    const mf_classic_access_bits_t* ac,
+                                    uint8_t                    gpb,
+                                    uint8_t                    out_trailer[16]);
+
+/**
+ * @brief Gera um trailer a partir de chaves e access bits (bytes 6-8).
+ *
+ * NAO valida paridade. Use mf_classic_build_trailer_safe() para gerar
+ * e validar os access bits automaticamente.
  *
  * @param key_a       6 bytes da Key A.
  * @param key_b       6 bytes da Key B.
