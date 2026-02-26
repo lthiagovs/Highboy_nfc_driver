@@ -1,3 +1,4 @@
+/* === main\hb_nfc_spi.c === */
 /**
  * @file hb_nfc_spi.c
  * @brief HAL SPI — implementation for ESP32-P4.
@@ -15,12 +16,37 @@
 
 #include <string.h>
 #include "driver/spi_master.h"
+#include "freertos/FreeRTOS.h"
 #include "esp_log.h"
 #include "esp_err.h"
 
+#define TAG TAG_SPI
 static const char* TAG = "hb_spi";
 static spi_device_handle_t s_spi = NULL;
 static bool s_init = false;
+
+/* Keep SPI polling bounded so tasks can yield. */
+#define HB_SPI_TIMEOUT_MS 10
+
+static hb_nfc_err_t hb_spi_transmit(spi_transaction_t* t)
+{
+    if (!s_spi || !t) return HB_NFC_ERR_SPI_XFER;
+
+    esp_err_t ret = spi_device_queue_trans(s_spi, t, pdMS_TO_TICKS(HB_SPI_TIMEOUT_MS));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "spi queue fail: %s", esp_err_to_name(ret));
+        return HB_NFC_ERR_SPI_XFER;
+    }
+
+    spi_transaction_t* done = NULL;
+    ret = spi_device_get_trans_result(s_spi, &done, pdMS_TO_TICKS(HB_SPI_TIMEOUT_MS));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "spi wait fail: %s", esp_err_to_name(ret));
+        return HB_NFC_ERR_SPI_XFER;
+    }
+
+    return HB_NFC_OK;
+}
 
 /* ═══════════════════════════════════════════════════════ */
 /*  Init / Deinit                                         */
@@ -87,8 +113,11 @@ hb_nfc_err_t hb_spi_reg_read(uint8_t addr, uint8_t* value)
         .tx_buffer = tx,
         .rx_buffer = rx,
     };
-    esp_err_t ret = spi_device_polling_transmit(s_spi, &t);
-    if (ret != ESP_OK) return HB_NFC_ERR_SPI_XFER;
+    hb_nfc_err_t err = hb_spi_transmit(&t);
+    if (err != HB_NFC_OK) {
+        *value = 0;
+        return err;
+    }
     *value = rx[1];
     return HB_NFC_OK;
 }
@@ -100,8 +129,7 @@ hb_nfc_err_t hb_spi_reg_write(uint8_t addr, uint8_t value)
         .length    = 16,
         .tx_buffer = tx,
     };
-    esp_err_t ret = spi_device_polling_transmit(s_spi, &t);
-    return (ret == ESP_OK) ? HB_NFC_OK : HB_NFC_ERR_SPI_XFER;
+    return hb_spi_transmit(&t);
 }
 
 hb_nfc_err_t hb_spi_reg_modify(uint8_t addr, uint8_t mask, uint8_t value)
@@ -129,8 +157,7 @@ hb_nfc_err_t hb_spi_fifo_load(const uint8_t* data, size_t len)
         .length    = (uint32_t)((len + 1) * 8),
         .tx_buffer = tx,
     };
-    esp_err_t ret = spi_device_polling_transmit(s_spi, &t);
-    return (ret == ESP_OK) ? HB_NFC_OK : HB_NFC_ERR_SPI_XFER;
+    return hb_spi_transmit(&t);
 }
 
 hb_nfc_err_t hb_spi_fifo_read(uint8_t* data, size_t len)
@@ -146,8 +173,8 @@ hb_nfc_err_t hb_spi_fifo_read(uint8_t* data, size_t len)
         .tx_buffer = tx,
         .rx_buffer = rx,
     };
-    esp_err_t ret = spi_device_polling_transmit(s_spi, &t);
-    if (ret != ESP_OK) return HB_NFC_ERR_SPI_XFER;
+    hb_nfc_err_t err = hb_spi_transmit(&t);
+    if (err != HB_NFC_OK) return err;
     memcpy(data, &rx[1], len);
     return HB_NFC_OK;
 }
@@ -162,8 +189,7 @@ hb_nfc_err_t hb_spi_direct_cmd(uint8_t cmd)
         .length    = 8,
         .tx_buffer = &cmd,
     };
-    esp_err_t ret = spi_device_polling_transmit(s_spi, &t);
-    return (ret == ESP_OK) ? HB_NFC_OK : HB_NFC_ERR_SPI_XFER;
+    return hb_spi_transmit(&t);
 }
 
 /* ═══════════════════════════════════════════════════════ */
@@ -191,8 +217,7 @@ hb_nfc_err_t hb_spi_pt_mem_write(uint8_t prefix, const uint8_t* data, size_t len
         .length    = (uint32_t)((len + 1) * 8),
         .tx_buffer = tx,
     };
-    esp_err_t ret = spi_device_polling_transmit(s_spi, &t);
-    return (ret == ESP_OK) ? HB_NFC_OK : HB_NFC_ERR_SPI_XFER;
+    return hb_spi_transmit(&t);
 }
 
 /**
@@ -222,8 +247,8 @@ hb_nfc_err_t hb_spi_pt_mem_read(uint8_t* data, size_t len)
         .tx_buffer = tx,
         .rx_buffer = rx,
     };
-    esp_err_t ret = spi_device_polling_transmit(s_spi, &t);
-    if (ret != ESP_OK) return HB_NFC_ERR_SPI_XFER;
+    hb_nfc_err_t err = hb_spi_transmit(&t);
+    if (err != HB_NFC_OK) return err;
     memcpy(data, &rx[2], len);                     /* data starts at rx[2] */
     return HB_NFC_OK;
 }
@@ -240,6 +265,91 @@ hb_nfc_err_t hb_spi_raw_xfer(const uint8_t* tx, uint8_t* rx, size_t len)
         .tx_buffer = tx,
         .rx_buffer = rx,
     };
-    esp_err_t ret = spi_device_polling_transmit(s_spi, &t);
-    return (ret == ESP_OK) ? HB_NFC_OK : HB_NFC_ERR_SPI_XFER;
+    return hb_spi_transmit(&t);
 }
+#undef TAG
+
+/* === main\hb_nfc_gpio.c === */
+/**
+ * @file hb_nfc_gpio.c
+ * @brief HAL GPIO — IRQ pin, matching working code pattern.
+ *
+ * Working code configures IRQ as input (no pull, no ISR)
+ * and reads level at boot. We replicate this exactly.
+ */
+#include "hb_nfc_gpio.h"
+
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_rom_sys.h"
+
+#define TAG TAG_GPIO
+static const char* TAG = "hb_gpio";
+static int s_pin_irq = -1;
+
+hb_nfc_err_t hb_gpio_init(int pin_irq)
+{
+    s_pin_irq = pin_irq;
+
+    /* Exact config from working code */
+    gpio_config_t cfg = {
+        .pin_bit_mask   = 1ULL << pin_irq,
+        .mode           = GPIO_MODE_INPUT,
+        .pull_up_en     = GPIO_PULLUP_DISABLE,
+        .pull_down_en   = GPIO_PULLDOWN_DISABLE,
+        .intr_type      = GPIO_INTR_DISABLE,
+    };
+    esp_err_t ret = gpio_config(&cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "IRQ pin %d config fail", pin_irq);
+        return HB_NFC_ERR_GPIO;
+    }
+
+    ESP_LOGI(TAG, "IRQ pin %d OK, level=%d", pin_irq, gpio_get_level(pin_irq));
+    return HB_NFC_OK;
+}
+
+void hb_gpio_deinit(void)
+{
+    if (s_pin_irq >= 0) {
+        gpio_reset_pin(s_pin_irq);
+        s_pin_irq = -1;
+    }
+}
+
+int hb_gpio_irq_level(void)
+{
+    if (s_pin_irq < 0) return 0;
+    return gpio_get_level(s_pin_irq);
+}
+
+bool hb_gpio_irq_wait(uint32_t timeout_ms)
+{
+    for (uint32_t i = 0; i < timeout_ms; i++) {
+        if (gpio_get_level(s_pin_irq)) return true;
+        esp_rom_delay_us(1000);
+    }
+    return false;
+}
+#undef TAG
+
+/* === main\hb_nfc_timer.c === */
+/**
+ * @file hb_nfc_timer.c
+ * @brief HAL Timer — uses esp_rom_delay_us (proven by working code).
+ */
+#include "hb_nfc_timer.h"
+#include "esp_rom_sys.h"
+
+void hb_delay_us(uint32_t us)
+{
+    esp_rom_delay_us(us);
+}
+
+void hb_delay_ms(uint32_t ms)
+{
+    for (uint32_t i = 0; i < ms; i++) {
+        esp_rom_delay_us(1000);
+    }
+}
+

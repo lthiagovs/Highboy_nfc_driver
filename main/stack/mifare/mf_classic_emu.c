@@ -133,6 +133,8 @@ static mfc_emu_state_t handle_value_op_phase2(const uint8_t* data, int len);
 static mfc_emu_state_t handle_transfer(uint8_t block_num);
 static mfc_emu_state_t handle_halt(void);
 static void emit_event(mfc_emu_event_type_t type);
+static bool osc_is_stable(uint8_t* aux_out, uint8_t* main_out, uint8_t* tgt_out);
+static bool wait_oscillator_stable(int timeout_ms, uint8_t* aux_out, uint8_t* main_out, uint8_t* tgt_out);
 
 /* ═══════════════════════════════════════════════════════════
  *  PRNG for nonce generation
@@ -1110,30 +1112,18 @@ hb_nfc_err_t mfc_emu_configure_target(void)
     ESP_LOGI(TAG, "Starting oscillator (OP_CTRL=0x80)...");
     hb_spi_reg_write(REG_OP_CTRL, OP_CTRL_EN);
 
-    bool osc_ok = false;
-    for (int i = 0; i < 200; i++) {
-        uint8_t aux = 0;
-        hb_spi_reg_read(REG_AUX_DISPLAY, &aux);
-        if (aux & 0x04) {
-            ESP_LOGI(TAG, "Oscillator stable in %dms (AUX=0x%02X)", i, aux);
-            osc_ok = true;
-            break;
-        }
-        vTaskDelay(1);
-    }
-
-    if (!osc_ok) {
+    uint8_t aux = 0, main = 0, tgt = 0;
+    bool osc_ok = wait_oscillator_stable(200, &aux, &main, &tgt);
+    if (osc_ok) {
+        ESP_LOGI(TAG, "Oscillator stable (AUX=0x%02X MAIN_INT=0x%02X TGT_INT=0x%02X)",
+                 aux, main, tgt);
+    } else {
         ESP_LOGW(TAG, "Oscillator not stable after 200ms, trying with EN+RX_EN...");
         hb_spi_reg_write(REG_OP_CTRL, OP_CTRL_EN | OP_CTRL_RX_EN);
-        for (int i = 0; i < 200; i++) {
-            uint8_t aux = 0;
-            hb_spi_reg_read(REG_AUX_DISPLAY, &aux);
-            if (aux & 0x04) {
-                ESP_LOGI(TAG, "Oscillator stable with EN+RX_EN in %dms (AUX=0x%02X)", i, aux);
-                osc_ok = true;
-                break;
-            }
-            vTaskDelay(1);
+        osc_ok = wait_oscillator_stable(200, &aux, &main, &tgt);
+        if (osc_ok) {
+            ESP_LOGI(TAG, "Oscillator stable with EN+RX_EN (AUX=0x%02X MAIN_INT=0x%02X TGT_INT=0x%02X)",
+                     aux, main, tgt);
         }
     }
 
@@ -1142,16 +1132,11 @@ hb_nfc_err_t mfc_emu_configure_target(void)
         ESP_LOGE(TAG, "This could mean:");
         ESP_LOGE(TAG, "  - Crystal/oscillator circuit issue");
         ESP_LOGE(TAG, "  - VDD not stable enough");
-        ESP_LOGE(TAG, "  - AUX_DISPLAY bit 2 not the osc bit for this revision");
-
-        uint8_t aux = 0;
-        hb_spi_reg_read(REG_AUX_DISPLAY, &aux);
-        ESP_LOGE(TAG, "AUX_DISPLAY=0x%02X — continuing anyway...", aux);
+        ESP_LOGE(TAG, "  - Oscillator stable flag not mapped as expected");
+        ESP_LOGE(TAG, "AUX_DISPLAY=0x%02X MAIN_INT=0x%02X TARGET_INT=0x%02X - continuing anyway...",
+                 aux, main, tgt);
     }
-
-    /* ══════════════════════════════════════════════════════════
-     *  STEP 3: CALIBRATE REGULATORS
-     * ══════════════════════════════════════════════════════════ */
+    /* STEP 3: CALIBRATE REGULATORS */
 
     hb_spi_direct_cmd(CMD_ADJUST_REGULATORS);
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -1169,17 +1154,11 @@ hb_nfc_err_t mfc_emu_configure_target(void)
     hb_spi_reg_write(REG_ISO14443A, 0x00);
 
     /*
-     * FIX: REG_PASSIVE_TARGET must have bit 0 (d_106) set to 1.
-     *
-     * With d_106=0 (old value 0x00), the ST25R3916 enters target
-     * mode but does not enable the NFC-A 106 kbps passive protocol.
-     * CMD_GOTO_SENSE runs but the chip never responds to REQA/WUPA,
-     * so WU_A and SDD_C interrupts never fire → 0 activations.
-     *
-     * d_106=1 tells the chip to listen for ISO 14443-A at 106 kbps,
-     * which is what every phone and Flipper Zero sends.
+     * REG_PASSIVE_TARGET: keep auto-collision enabled (0x00) — matches
+     * the working poller defaults. We will only change this if field
+     * detection remains dead with proper thresholds.
      */
-    hb_spi_reg_write(REG_PASSIVE_TARGET, 0x01);  /* d_106=1: NFC-A 106kbps enabled */
+    hb_spi_reg_write(REG_PASSIVE_TARGET, 0x00);
 
     /* ══════════════════════════════════════════════════════════
      *  STEP 5: LOAD PT MEMORY (ATQA/UID/SAK)
@@ -1214,14 +1193,15 @@ hb_nfc_err_t mfc_emu_configure_target(void)
      *  STEP 6: FIELD DETECTION THRESHOLDS
      * ══════════════════════════════════════════════════════════ */
 
-    hb_spi_reg_write(REG_FIELD_THRESH_ACT, 0x03);
-    hb_spi_reg_write(REG_FIELD_THRESH_DEACT, 0x01);
+    /* Match poller defaults (known good RF behavior). */
+    hb_spi_reg_write(REG_FIELD_THRESH_ACT, 0x33);
+    hb_spi_reg_write(REG_FIELD_THRESH_DEACT, 0x22);
 
     /* ══════════════════════════════════════════════════════════
      *  STEP 7: PASSIVE TARGET MODULATION DEPTH
      * ══════════════════════════════════════════════════════════ */
 
-    hb_spi_reg_write(REG_PT_MOD, 0x17);
+    hb_spi_reg_write(REG_PT_MOD, 0x60);
 
     /* ══════════════════════════════════════════════════════════
      *  STEP 8: UNMASK ALL INTERRUPTS
@@ -1253,9 +1233,9 @@ hb_nfc_err_t mfc_emu_configure_target(void)
         return HB_NFC_ERR_INTERNAL;
     }
 
-    /* Sanity check: REG_PASSIVE_TARGET must be 0x01 */
-    if (pt_rb != 0x01) {
-        ESP_LOGE(TAG, "PASSIVE_TARGET readback mismatch! Expected 0x01 got 0x%02X", pt_rb);
+    /* Sanity check: REG_PASSIVE_TARGET should be 0x00 (auto-collision on) */
+    if (pt_rb != 0x00) {
+        ESP_LOGE(TAG, "PASSIVE_TARGET readback mismatch! Expected 0x00 got 0x%02X", pt_rb);
         return HB_NFC_ERR_INTERNAL;
     }
 
@@ -1590,3 +1570,359 @@ void mfc_emu_card_data_init(mfc_emu_card_data_t* cd,
     default:              cd->sector_count = 16; cd->total_blocks = 64;  break;
     }
 }
+
+/* ====================================================================== */
+/*  Type 2 Tag Emulation (Ultralight/NTAG) — simple NDEF for quick tests   */
+/* ====================================================================== */
+
+#define T2T_PAGE_SIZE   4
+#define T2T_PAGE_COUNT  16
+#define T2T_MEM_SIZE    (T2T_PAGE_SIZE * T2T_PAGE_COUNT)
+
+#define T2T_CMD_READ        0x30
+#define T2T_CMD_FAST_READ   0x3A
+#define T2T_CMD_GET_VERSION 0x60
+#define T2T_CMD_HALT        0x50
+
+typedef enum {
+    T2T_STATE_IDLE = 0,
+    T2T_STATE_LISTEN,
+    T2T_STATE_ACTIVE,
+} t2t_emu_state_t;
+
+static struct {
+    uint8_t uid[7];
+    uint8_t uid_len;
+    uint8_t atqa[2];
+    uint8_t sak;
+    uint8_t mem[T2T_MEM_SIZE];
+    int     page_count;
+    bool    initialized;
+    t2t_emu_state_t state;
+} s_t2t = { 0 };
+
+/* Large struct must not live on the stack (task stack is small). */
+static mfc_emu_card_data_t s_t2t_pt_card;
+
+static bool osc_is_stable(uint8_t* aux_out, uint8_t* main_out, uint8_t* tgt_out)
+{
+    uint8_t aux = 0, main = 0, tgt = 0;
+    hb_spi_reg_read(REG_AUX_DISPLAY, &aux);
+    hb_spi_reg_read(REG_MAIN_INT, &main);
+    hb_spi_reg_read(REG_TARGET_INT, &tgt);
+
+    if (aux_out) *aux_out = aux;
+    if (main_out) *main_out = main;
+    if (tgt_out) *tgt_out = tgt;
+
+    return ((aux & 0x04) != 0) || ((main & IRQ_MAIN_OSC) != 0) || ((tgt & IRQ_TGT_OSCF) != 0);
+}
+
+static bool wait_oscillator_stable(int timeout_ms, uint8_t* aux_out, uint8_t* main_out, uint8_t* tgt_out)
+{
+    int ticks = (int)pdMS_TO_TICKS(timeout_ms);
+    if (ticks < 1) ticks = 1;
+
+    for (int i = 0; i < ticks; i++) {
+        if (osc_is_stable(aux_out, main_out, tgt_out)) return true;
+        vTaskDelay(1);
+    }
+
+    /* Capture last status for logging. */
+    (void)osc_is_stable(aux_out, main_out, tgt_out);
+    return false;
+}
+
+static size_t t2t_build_ndef_text(const char* text, uint8_t* out, size_t max)
+{
+    if (!text || !out || max < 8) return 0;
+
+    size_t text_len = strlen(text);
+    if (text_len > 250) return 0;
+
+    size_t payload_len = 1 + 2 + text_len; /* status + "en" + text */
+    if (payload_len > 255) return 0;
+
+    size_t total_len = 4 + payload_len; /* header(3) + type + payload */
+    if (total_len > max) return 0;
+
+    out[0] = 0xD1; /* MB/ME/SR + TNF=1 (well-known) */
+    out[1] = 0x01; /* type length */
+    out[2] = (uint8_t)payload_len;
+    out[3] = 'T';
+    out[4] = 0x02; /* UTF-8 + "en" */
+    out[5] = 'e';
+    out[6] = 'n';
+    memcpy(&out[7], text, text_len);
+    return total_len;
+}
+
+static bool t2t_build_default_memory(const char* text)
+{
+    memset(s_t2t.mem, 0x00, sizeof(s_t2t.mem));
+
+    if (s_t2t.uid_len == 7) {
+        uint8_t bcc0 = s_t2t.uid[0] ^ s_t2t.uid[1] ^ s_t2t.uid[2] ^ 0x88;
+        uint8_t bcc1 = s_t2t.uid[3] ^ s_t2t.uid[4] ^ s_t2t.uid[5] ^ s_t2t.uid[6];
+
+        s_t2t.mem[0] = s_t2t.uid[0];
+        s_t2t.mem[1] = s_t2t.uid[1];
+        s_t2t.mem[2] = s_t2t.uid[2];
+        s_t2t.mem[3] = bcc0;
+
+        s_t2t.mem[4] = s_t2t.uid[3];
+        s_t2t.mem[5] = s_t2t.uid[4];
+        s_t2t.mem[6] = s_t2t.uid[5];
+        s_t2t.mem[7] = s_t2t.uid[6];
+
+        s_t2t.mem[8]  = bcc1;
+        s_t2t.mem[9]  = 0x48; /* internal */
+        s_t2t.mem[10] = 0x00;
+        s_t2t.mem[11] = 0x00;
+    } else if (s_t2t.uid_len == 4) {
+        uint8_t bcc0 = s_t2t.uid[0] ^ s_t2t.uid[1] ^ s_t2t.uid[2] ^ s_t2t.uid[3];
+        s_t2t.mem[0] = s_t2t.uid[0];
+        s_t2t.mem[1] = s_t2t.uid[1];
+        s_t2t.mem[2] = s_t2t.uid[2];
+        s_t2t.mem[3] = bcc0;
+        s_t2t.mem[4] = s_t2t.uid[3];
+    }
+
+    /* Capability Container (page 3) */
+    size_t data_bytes = (size_t)(s_t2t.page_count - 4) * T2T_PAGE_SIZE;
+    if (data_bytes < 8) return false;
+
+    s_t2t.mem[12] = 0xE1;                     /* NDEF magic */
+    s_t2t.mem[13] = 0x10;                     /* version 1.0 */
+    s_t2t.mem[14] = (uint8_t)(data_bytes / 8);/* data area size in 8-byte units */
+    s_t2t.mem[15] = 0x00;                     /* read/write */
+
+    uint8_t ndef[64] = { 0 };
+    size_t ndef_len = t2t_build_ndef_text(text, ndef, sizeof(ndef));
+    if (ndef_len == 0) return false;
+
+    size_t tlv_len = 2 + ndef_len + 1; /* TLV type + len + NDEF + terminator */
+    if (tlv_len > data_bytes) return false;
+
+    size_t off = 4 * T2T_PAGE_SIZE; /* page 4 */
+    s_t2t.mem[off + 0] = 0x03;             /* NDEF TLV */
+    s_t2t.mem[off + 1] = (uint8_t)ndef_len;
+    memcpy(&s_t2t.mem[off + 2], ndef, ndef_len);
+    s_t2t.mem[off + 2 + ndef_len] = 0xFE;  /* Terminator TLV */
+    return true;
+}
+
+static hb_nfc_err_t t2t_tx_nack(uint8_t code)
+{
+    uint8_t v = (uint8_t)(code & 0x0F);
+    st25r_fifo_clear();
+    st25r_set_tx_bytes(0, 4);
+    st25r_fifo_load(&v, 1);
+    hb_spi_direct_cmd(CMD_TX_WO_CRC);
+
+    if (!st25r_irq_wait_txe()) {
+        ESP_LOGW(TAG, "T2T NACK TX timeout");
+        return HB_NFC_ERR_TX_TIMEOUT;
+    }
+    return HB_NFC_OK;
+}
+
+static void t2t_read_pages(uint8_t start_page, uint8_t* out, size_t out_len)
+{
+    size_t offset = (size_t)start_page * T2T_PAGE_SIZE;
+    for (size_t i = 0; i < out_len; i++) {
+        size_t idx = offset + i;
+        out[i] = (idx < T2T_MEM_SIZE) ? s_t2t.mem[idx] : 0x00;
+    }
+}
+
+hb_nfc_err_t t2t_emu_init_default(void)
+{
+    memset(&s_t2t, 0, sizeof(s_t2t));
+
+    static const uint8_t uid7[7] = { 0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
+    memcpy(s_t2t.uid, uid7, sizeof(uid7));
+    s_t2t.uid_len = 7;
+    s_t2t.atqa[0] = 0x44;
+    s_t2t.atqa[1] = 0x00;
+    s_t2t.sak = 0x00;
+    s_t2t.page_count = T2T_PAGE_COUNT;
+
+    if (!t2t_build_default_memory("High Boy NFC")) {
+        return HB_NFC_ERR_INTERNAL;
+    }
+
+    s_t2t.initialized = true;
+    s_t2t.state = T2T_STATE_IDLE;
+    return HB_NFC_OK;
+}
+
+hb_nfc_err_t t2t_emu_configure_target(void)
+{
+    if (!s_t2t.initialized) return HB_NFC_ERR_INTERNAL;
+
+    /* Reuse the Classic target config path (PT memory + registers). */
+    memset(&s_t2t_pt_card, 0, sizeof(s_t2t_pt_card));
+    memcpy(s_t2t_pt_card.uid, s_t2t.uid, s_t2t.uid_len);
+    s_t2t_pt_card.uid_len = s_t2t.uid_len;
+    s_t2t_pt_card.atqa[0] = s_t2t.atqa[0];
+    s_t2t_pt_card.atqa[1] = s_t2t.atqa[1];
+    s_t2t_pt_card.sak = s_t2t.sak;
+    s_t2t_pt_card.sector_count = 0;
+    s_t2t_pt_card.total_blocks = 0;
+    s_t2t_pt_card.type = MF_CLASSIC_1K;
+
+    hb_nfc_err_t err = mfc_emu_init(&s_t2t_pt_card);
+    if (err != HB_NFC_OK) return err;
+
+    err = mfc_emu_configure_target();
+    if (err != HB_NFC_OK) return err;
+
+    /* Keep the target configuration from mfc_emu_configure_target(). */
+    uint8_t pt = 0, fa = 0, fd = 0, pm = 0;
+    hb_spi_reg_read(REG_PASSIVE_TARGET, &pt);
+    hb_spi_reg_read(REG_FIELD_THRESH_ACT, &fa);
+    hb_spi_reg_read(REG_FIELD_THRESH_DEACT, &fd);
+    hb_spi_reg_read(REG_PT_MOD, &pm);
+    ESP_LOGI(TAG, "T2T cfg (post-mfc): PT=0x%02X FLD_ACT=0x%02X FLD_DEACT=0x%02X PT_MOD=0x%02X",
+             pt, fa, fd, pm);
+
+    return HB_NFC_OK;
+}
+
+hb_nfc_err_t t2t_emu_start(void)
+{
+    if (!s_t2t.initialized) return HB_NFC_ERR_INTERNAL;
+
+    st25r_irq_read();
+    /* Match classic emu start: enable RX (no field) then go to sense. */
+    hb_spi_reg_write(REG_OP_CTRL, OP_CTRL_EN | OP_CTRL_RX_EN);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    hb_spi_direct_cmd(CMD_GOTO_SENSE);
+    vTaskDelay(pdMS_TO_TICKS(2));
+
+    {
+        uint8_t op = 0, aux = 0, pt = 0, pts = 0;
+        hb_spi_reg_read(REG_OP_CTRL, &op);
+        hb_spi_reg_read(REG_AUX_DISPLAY, &aux);
+        hb_spi_reg_read(REG_PASSIVE_TARGET, &pt);
+        hb_spi_reg_read(REG_PASSIVE_TARGET_STS, &pts);
+        ESP_LOGI(TAG, "T2T start: OP_CTRL=0x%02X AUX=0x%02X PT=0x%02X PT_STS=0x%02X",
+                 op, aux, pt, pts);
+    }
+
+    s_t2t.state = T2T_STATE_LISTEN;
+    ESP_LOGI(TAG, "T2T emulator listening...");
+    return HB_NFC_OK;
+}
+
+void t2t_emu_stop(void)
+{
+    s_t2t.state = T2T_STATE_IDLE;
+    hb_spi_direct_cmd(CMD_STOP_ALL);
+}
+
+void t2t_emu_run_step(void)
+{
+    if (!s_t2t.initialized) return;
+
+    switch (s_t2t.state) {
+    case T2T_STATE_IDLE:
+        return;
+
+    case T2T_STATE_LISTEN: {
+        uint8_t tgt_irq = 0, main_irq = 0, err_irq = 0;
+        hb_spi_reg_read(REG_TARGET_INT, &tgt_irq);
+        hb_spi_reg_read(REG_MAIN_INT, &main_irq);
+        hb_spi_reg_read(REG_ERROR_INT, &err_irq);
+        if (tgt_irq || main_irq || err_irq) {
+            ESP_LOGI(TAG, "T2T IRQ: TGT=0x%02X MAIN=0x%02X ERR=0x%02X",
+                     tgt_irq, main_irq, err_irq);
+        }
+        if (tgt_irq & IRQ_TGT_WU_A) {
+            ESP_LOGI(TAG, "T2T WU_A (field detected)");
+        }
+        if (tgt_irq & IRQ_TGT_SDD_C) {
+            ESP_LOGI(TAG, "T2T selected (SDD_C)");
+            s_t2t.state = T2T_STATE_ACTIVE;
+        }
+
+        if (!(tgt_irq | main_irq | err_irq)) {
+            static uint32_t idle_ticks = 0;
+            idle_ticks++;
+            if ((idle_ticks % 500U) == 0U) {
+                hb_spi_direct_cmd(CMD_MEAS_AMPLITUDE);
+                vTaskDelay(1);
+                uint8_t ad = 0, aux = 0, pts = 0;
+                hb_spi_reg_read(REG_AD_RESULT, &ad);
+                hb_spi_reg_read(REG_AUX_DISPLAY, &aux);
+                hb_spi_reg_read(REG_PASSIVE_TARGET_STS, &pts);
+                ESP_LOGI(TAG, "T2T idle: AD=%u AUX=0x%02X PT_STS=0x%02X",
+                         ad, aux, pts);
+                hb_spi_direct_cmd(CMD_GOTO_SENSE);
+            }
+        }
+        break;
+    }
+
+    case T2T_STATE_ACTIVE: {
+        uint8_t cmd[32] = { 0 };
+        int len = target_rx_poll(cmd, sizeof(cmd));
+        if (len < 0) {
+            ESP_LOGW(TAG, "T2T field lost");
+            hb_spi_direct_cmd(CMD_GOTO_SENSE);
+            s_t2t.state = T2T_STATE_LISTEN;
+            break;
+        }
+        if (len == 0) break;
+
+        switch (cmd[0]) {
+        case T2T_CMD_READ: {
+            if (len < 2) { t2t_tx_nack(0x00); break; }
+            uint8_t page = cmd[1];
+            if (page >= s_t2t.page_count) { t2t_tx_nack(0x00); break; }
+            uint8_t resp[16];
+            t2t_read_pages(page, resp, sizeof(resp));
+            (void)target_tx_with_crc(resp, sizeof(resp));
+            break;
+        }
+
+        case T2T_CMD_FAST_READ: {
+            if (len < 3) { t2t_tx_nack(0x00); break; }
+            uint8_t start = cmd[1];
+            uint8_t end   = cmd[2];
+            if (start > end || end >= s_t2t.page_count) { t2t_tx_nack(0x00); break; }
+            size_t pages = (size_t)(end - start + 1);
+            size_t resp_len = pages * T2T_PAGE_SIZE;
+            if (resp_len > 64) resp_len = 64;
+            uint8_t resp[64];
+            t2t_read_pages(start, resp, resp_len);
+            (void)target_tx_with_crc(resp, resp_len);
+            break;
+        }
+
+        case T2T_CMD_GET_VERSION: {
+            const uint8_t ver[8] = { 0x00, 0x04, 0x04, 0x02, 0x01, 0x00, 0x0F, 0x03 };
+            (void)target_tx_with_crc(ver, sizeof(ver));
+            break;
+        }
+
+        case T2T_CMD_HALT: {
+            if (len >= 2 && cmd[1] == 0x00) {
+                ESP_LOGI(TAG, "T2T HALT");
+                hb_spi_direct_cmd(CMD_GOTO_SENSE);
+                s_t2t.state = T2T_STATE_LISTEN;
+            }
+            break;
+        }
+
+        default:
+            t2t_tx_nack(0x00);
+            break;
+        }
+        break;
+    }
+    }
+}
+
+

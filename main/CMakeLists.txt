@@ -1,6 +1,20 @@
-file(GLOB MAIN_SRCS "mf_classic_writer.c" "main_write_example.c" "hb_nfc_spi.c" "mf_classic_emu.c" "main.c" "nfc_reader.c" "nfc_card_info.c" "${CMAKE_CURRENT_LIST_DIR}/*.c")
+set(MAIN_SRCS
+    "app/main.c"
+    "hal/hb_nfc_hal.c"
+    "driver/st25r3916.c"
+    "stack/iso14443a/iso14443a.c"
+    "stack/mifare/mifare.c"
+    "stack/mifare/mf_classic_emu.c"
+    "app/nfc_app.c"
+)
 
 idf_component_register(
     SRCS ${MAIN_SRCS}
-    INCLUDE_DIRS "."
+    INCLUDE_DIRS
+        "include"
+        "include/hal"
+        "include/driver"
+        "include/stack/iso14443a"
+        "include/stack/mifare"
+        "include/app"
 )

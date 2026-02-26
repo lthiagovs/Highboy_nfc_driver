@@ -236,6 +236,25 @@ void mfc_emu_card_data_init(mfc_emu_card_data_t* cd,
                              const nfc_iso14443a_data_t* card,
                              mf_classic_type_t type);
 
+/*
+ * Type 2 Tag Emulation (Ultralight/NTAG — simple NDEF)
+ */
+
+/** Initialize Type 2 emulation with a default UID + NDEF text payload. */
+hb_nfc_err_t t2t_emu_init_default(void);
+
+/** Configure ST25R3916 target mode for Type 2 emulation. */
+hb_nfc_err_t t2t_emu_configure_target(void);
+
+/** Start Type 2 emulation (enter listen state). */
+hb_nfc_err_t t2t_emu_start(void);
+
+/** Run one step of Type 2 emulation loop (non-blocking). */
+void t2t_emu_run_step(void);
+
+/** Stop Type 2 emulation. */
+void t2t_emu_stop(void);
+
 /* ═══════════════════════════════════════════════════════════
  *  Access Control Helpers (public for testing)
  * ═══════════════════════════════════════════════════════════ */

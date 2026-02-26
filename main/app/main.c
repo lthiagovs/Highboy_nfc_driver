@@ -21,11 +21,16 @@
 #include "poller.h"
 #include "mf_ultralight.h"
 #include "mf_classic.h"
+#include "mf_classic_emu.h"
+#include "emu_diag.h"
 #include "nfc_card_info.h"
 #include "nfc_reader.h"
 #include "mf_classic_writer.h"
 
 static const char* TAG = "hb_main";
+
+#define RUN_T2T_EMU_TEST 0
+#define RUN_EMU_DIAG     1
 
 /* ─────────────────────────────────────────────────────────
  *  Dados de exemplo para escrita
@@ -57,6 +62,61 @@ static void hex_str(const uint8_t* data, size_t len, char* buf, size_t buf_sz)
     for (size_t i = 0; i < len && pos + 3 < buf_sz; i++) {
         pos += (size_t)snprintf(buf + pos, buf_sz - pos,
                                 "%02X%s", data[i], i + 1 < len ? " " : "");
+    }
+}
+
+static void t2t_emu_task(void* arg)
+{
+    (void)arg;
+    while (1) {
+        t2t_emu_run_step();
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+static void do_t2t_emu_test(void)
+{
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Iniciando emulacao NFC-A Type 2 (NDEF simples)...");
+
+    highboy_nfc_config_t cfg = HIGHBOY_NFC_CONFIG_DEFAULT();
+    hb_nfc_err_t err = st25r_init(&cfg);
+    if (err != HB_NFC_OK) {
+        ESP_LOGE(TAG, "Init FAILED: %s", hb_nfc_err_str(err));
+        return;
+    }
+
+    err = t2t_emu_init_default();
+    if (err != HB_NFC_OK) {
+        ESP_LOGE(TAG, "t2t_emu_init_default failed: %s", hb_nfc_err_str(err));
+        return;
+    }
+
+    err = t2t_emu_configure_target();
+    if (err != HB_NFC_OK) {
+        ESP_LOGE(TAG, "t2t_emu_configure_target failed: %s", hb_nfc_err_str(err));
+        return;
+    }
+
+    err = t2t_emu_start();
+    if (err != HB_NFC_OK) {
+        ESP_LOGE(TAG, "t2t_emu_start failed: %s", hb_nfc_err_str(err));
+        return;
+    }
+
+    ESP_LOGI(TAG, "Aproxime o celular (NDEF deve aparecer como 'High Boy NFC')");
+
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        t2t_emu_task,
+        "t2t_emu",
+        4096,
+        NULL,
+        tskIDLE_PRIORITY + 1,
+        NULL,
+        1  /* CPU1 */
+    );
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Falha ao criar task t2t_emu");
     }
 }
 
@@ -118,6 +178,20 @@ static void do_write(nfc_iso14443a_data_t* card)
  * ───────────────────────────────────────────────────────── */
 void app_main(void)
 {
+    if (RUN_EMU_DIAG) {
+        highboy_nfc_config_t cfg = HIGHBOY_NFC_CONFIG_DEFAULT();
+        hb_nfc_err_t err = st25r_init(&cfg);
+        if (err != HB_NFC_OK) {
+            ESP_LOGE(TAG, "Init FAILED: %s", hb_nfc_err_str(err));
+            return;
+        }
+        emu_diag_full();
+        return;
+    }
+    if (RUN_T2T_EMU_TEST) {
+        do_t2t_emu_test();
+        return;
+    }
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "╔══════════════════════════════════════════════════╗");
     ESP_LOGI(TAG, "║  HIGH BOY NFC — ST25R3916                        ║");
